@@ -1,2 +1,4 @@
 *.o
 stunnel.so
+slurm-spank-stunnel.so
+build.sh

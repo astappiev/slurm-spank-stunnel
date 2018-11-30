@@ -2,9 +2,11 @@
  slurm-spank-stunnel.c - SLURM SPANK TUNNEL plugin
  ***************************************************************************
  * Copyright  Harvard University (2014)
+ * Copyright  Quantum HPC Inc. (2018)
  *
  * Written by Aaron Kitzmiller <aaron_kitzmiller@harvard.edu> based on
  * X11 SPANK by Matthieu Hautreux <matthieu.hautreux@cea.fr>
+ * Modified by Quentin Lux <qlux@quantumhpc.com>
  *
  * This file is part of slurm-spank-stunnel, a SLURM SPANK Plugin aiming at
  * providing arbitrary port forwarding on SLURM execution
@@ -45,7 +47,15 @@
 #include <slurm/spank.h>
 
 
-#define STUNNEL_ENVVAR		 "SLURM_STUNNEL"
+#define STUNNEL_ENVVAR		 			"SLURM_STUNNEL"
+/*
+*  Determine whether ssh tunnels are started from a local or remote context
+*
+*  = 1   remote context, i.e. tunnel started from first compute node
+*  = 0   not remote context, tunnel started from srun machine submission
+*/
+#define STUNNEL_MODE		 				"STUNNEL_MODE"
+#define STUNNEL_CONTROL_FILE		"STUNNEL_CONTROL_FILE"
 
 #define INFO slurm_info
 #define DEBUG slurm_debug
@@ -56,7 +66,8 @@ static char* ssh_cmd = NULL;
 static char* ssh_args = NULL;
 static char* helpertask_args = NULL ;
 static char* args = NULL;
-
+static char* tunnel_host = NULL;
+static char* tunnel_controlfile = NULL;
 
 /*
  * can be used to adapt the ssh parameters to use to
@@ -79,13 +90,7 @@ static char* args = NULL;
 /*
  * string pattern for file used as the ssh control master file
  */
-#define CONTROL_FILE_PATTERN	"/tmp/%s-control.tunnel"
-
-/*
- * string pattern for file used to indicate that slurm_spank_exit has
- * already been run
- */
-#define EXIT_FLAG_PATTERN	   "/tmp/%s-exitflag.tunnel"
+#define CONTROL_FILE_PATTERN	"/tmp/%d-%d-control.tunnel"
 
 /*
  * All spank plugins must define this macro for the SLURM plugin loader.
@@ -98,12 +103,13 @@ SPANK_PLUGIN(stunnel, 1);
  */
 int port_available(int port)
 {
+	DEBUG("STUNNEL=> TESTING PORT %d", port);
 	int result = 1;
 
 	struct sockaddr_in serv_addr;
 	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if( sockfd < 0 ) {
-		fprintf(stderr,"Error getting socket for port check.\n");
+		ERROR("STUNNEL=> Error getting socket for port check.");
 		return 0;
 	}
 
@@ -117,7 +123,7 @@ int port_available(int port)
 	}
 
 	if (close (sockfd) < 0 ) {
-		fprintf(stderr,"Close of socket during port test failed?? fd: %s\n", strerror(errno));
+		ERROR("STUNNEL=> Close of socket during port test failed?? fd: %s", strerror(errno));
 		result = 0;
 	}
 	return result;
@@ -131,130 +137,129 @@ int file_exists(char *filename){
 /*
  * Writes the file that records the hostname
  */
-int write_host_file(char *host)
-{
-	FILE* file;
-	char filename[256];
-	char *user = getenv("USER");
-
-	// build file reference
-	if ( snprintf(filename,256,HOST_FILE_PATTERN,user) >= 256 ) {
-		fprintf(stderr,"Error: Unable to build file reference\n");
-		return 20;
-	}
-
-	// this file shouldn't exist, so warn
-	if (file_exists(filename)){
-		fprintf(stderr,"Warning: The hostname file %s exists and will be overwritten.  There may stray ssh processes that should be killed.\n", filename);
-	}
-
-	// write it into reference file
-	file = fopen(filename,"w");
-	if ( file == NULL ) {
-		fprintf(stderr,"error: unable to create file %s\n", filename);
-		return 30;
-	}
-
-	fprintf(file,"%s\n",host);
-	fclose(file);
-	return 0;
-}
-
-/*
- * Reads the host file so that the ssh tunnel can be terminated.  Deletes the
- * host file when it's done reading.
- */
-int read_host_file(char *buf)
-{
-	FILE* file;
-	char filename[256];
-	char *user = getenv("USER");
-
-	// build file reference
-	if ( snprintf(filename,256,HOST_FILE_PATTERN,user) >= 256 ) {
-		fprintf(stderr,"tunnel: unable to build file reference\n");
-		return 20;
-	}
-	file = fopen(filename,"r");
-	if ( file == NULL ) {
-		// fprintf(stderr,"tunnel: unable to read file %s. You may need to manually kill ssh tunnel processes.\n", filename);
-		return 30;
-	}
-
-	//Read the lines of the host file
-	char line[100];
-	if (fgets(line,100,file) == NULL) {
-		fprintf(stderr,"Unable to read from file %s\n",filename);
-	}
-	if (line[strlen(line) - 1] == '\n') {
-		line[strlen(line) - 1] = '\0';
-	}
-	snprintf(buf,100,"%s",line);
-	fclose(file);
-	unlink(filename);
-	return 0;
-}
-
-
-/*
- *  Provide a --tunnel option to srun:
- */
-static int _tunnel_opt_process (int val, const char *optarg, int remote);
-
-struct spank_option spank_opts[] =
-{
-		{ "tunnel", "<submit port:exec port[,submit port:exec port,...]>",
-				"Forward exec host port to submit host port via ssh -L", 1, 0,
-				(spank_opt_cb_f) _tunnel_opt_process
-		},
-		SPANK_OPTIONS_TABLE_END
-};
-
+// int write_host_file(spank_t spank, char *host)
+// {
+//
+// 	DEBUG("writing host file");
+// 	FILE* file;
+// 	char filename[256];
+// 	char *user = getenv("USER");
+//
+// 	// build file reference
+// 	if ( snprintf(filename,256,HOST_FILE_PATTERN,user) >= 256 ) {
+// 		ERROR("Error: Unable to build file reference");
+// 		return 20;
+// 	}
+//
+// 	// this file shouldn't exist, so warn
+// 	if (file_exists(filename)){
+// 		ERROR("Warning: The hostname file %s exists and will be overwritten.  There may stray ssh processes that should be killed.", filename);
+// 	}
+//
+// 	// write it into reference file
+// 	file = fopen(filename,"w");
+// 	if ( file == NULL ) {
+// 		ERROR("error: unable to create file %s", filename);
+// 		return 30;
+// 	}
+//
+// 	fprintf(file,"%s",host);
+// 	fclose(file);
+// 	return 0;
+// }
+//
+// /*
+//  * Reads the host file so that the ssh tunnel can be terminated.  Deletes the
+//  * host file when it's done reading.
+//  */
+// int read_host_file(char *buf)
+// {
+//
+// 	DEBUG("parsing host file");
+// 	FILE* file;
+// 	char filename[256];
+// 	char *user = getenv("USER");
+//
+// 	// build file reference
+// 	if ( snprintf(filename,256,HOST_FILE_PATTERN,user) >= 256 ) {
+// 		ERROR("tunnel: unable to build file reference");
+// 		return 20;
+// 	}
+// 	file = fopen(filename,"r");
+// 	if ( file == NULL ) {
+// 		// ERROR("tunnel: unable to read file %s. You may need to manually kill ssh tunnel processes.", filename);
+// 		return 30;
+// 	}
+//
+// 	//Read the lines of the host file
+// 	char line[100];
+// 	if (fgets(line,100,file) == NULL) {
+// 		ERROR("Unable to read from file %s",filename);
+// 	}
+// 	if (line[strlen(line) - 1] == '\n') {
+// 		line[strlen(line) - 1] = '\0';
+// 	}
+// 	snprintf(buf,100,"%s",line);
+// 	fclose(file);
+// 	unlink(filename);
+// 	return 0;
+// }
 
 /*
- *
- * This is used to process any options in the config file
- *
+ * Build an SSH control file based on the pattern with UID and JOBID
  */
-void _stunnel_init_config(spank_t sp, int ac, char *av[]);
-
-int slurm_spank_init (spank_t sp, int ac, char *av[])
+int _build_control_file (spank_t spank)
 {
-	spank_option_register(sp,spank_opts);
-	_stunnel_init_config(sp,ac,av);
+	uid_t uid;
+	uint32_t jobid;
+	size_t controlfile_length;
+	if(spank_get_item (spank, S_JOB_UID, &uid) != ESPANK_SUCCESS ) {
+		DEBUG("STUNNEL=> Cannot get user id");
+		exit(1);
+	}
 
-	return 0;
+	if(spank_get_item (spank, S_JOB_ID, &jobid) != ESPANK_SUCCESS ) {
+		DEBUG("STUNNEL=> Cannot get job id");
+		exit(1);
+	}
+
+	controlfile_length = strlen(CONTROL_FILE_PATTERN) + 128;
+	tunnel_controlfile = (char*) malloc(controlfile_length*sizeof(char));
+
+	// Setup the control file name
+	snprintf(tunnel_controlfile,controlfile_length,CONTROL_FILE_PATTERN, uid, jobid);
+
+	DEBUG("STUNNEL=> ===>control file %s",tunnel_controlfile);
+	return tunnel_controlfile == NULL;
 }
 
 /*
  * This does the actual port forward.  An ssh control master file is used
  * when the connection is established so that it can be terminated later.
  */
-int _connect_node (char* node)
+int _connect_node (spank_t spank, char* node)
 {
+	DEBUG("STUNNEL=> CONNECTING NODE : %s",node);
+
 	int status = -1;
 	char* expc_pattern="%s %s %s %s -f -N -M -S %s %s";
 	char* expc_cmd;
 	size_t expc_length;
 
-
-	// Setup the control file name
-	char controlfile[1024];
-	char *user = getenv("USER");
-	if (snprintf(controlfile,1024,CONTROL_FILE_PATTERN,user) > 1024){
-		fprintf(stderr,"Unable to construct control file name; too big\n");
-		exit(1);
-	}
-
 	// If this control file already exists on this submit host, bail out
-	if (file_exists(controlfile)) {
-		fprintf(stderr,"ssh control file %s already exists.  Either you already have a tunnel in place, or one did not terminate correctly.  Please remove this file.\n", controlfile);
+	if (file_exists(tunnel_controlfile)) {
+		ERROR("STUNNEL=> ssh control file %s already exists. Either you already have a tunnel in place, or one did not terminate correctly. Please remove this file.", tunnel_controlfile);
 		exit(1);
 	}
-
 
 	// sshcmd is already set
-	expc_length = strlen(node) + strlen(ssh_cmd)  + strlen(args) + strlen(controlfile) + 20;
+	expc_length = strlen(node) +
+								strlen(ssh_cmd) +
+								strlen(ssh_args) +
+								strlen(args) +
+								strlen(tunnel_controlfile) +
+								strlen(helpertask_args) +
+								20;
 	expc_cmd = (char*) malloc(expc_length*sizeof(char));
 	if ( expc_cmd != NULL ) {
 		snprintf(expc_cmd,expc_length,expc_pattern,
@@ -262,14 +267,15 @@ int _connect_node (char* node)
 				(ssh_args == NULL) ? DEFAULT_SSH_ARGS : ssh_args,
 				node,
 				args,
-				controlfile,
+				tunnel_controlfile,
 				(helpertask_args == NULL) ? DEFAULT_HELPERTASK_ARGS : helpertask_args);
+		DEBUG("STUNNEL=> ssh_cmd : %s", expc_cmd);
 		status = system(expc_cmd);
-		if ( status == -1 )
-			  ERROR("tunnel: unable to connect node %s with command %s",node,expc_cmd);
-		else {
+		if ( status == -1 ){
+			  ERROR("STUNNEL=> tunnel: unable to connect node %s with command %s",node,expc_cmd);
+		}else{
 			  // Write the hostname to a file
-			  write_host_file(node);
+			  // write_host_file(spank, node);
 		}
 		free(expc_cmd);
 	}
@@ -284,16 +290,15 @@ int _connect_node (char* node)
  * Takes the first of the allocated nodes and passes to _connect_node
  *
  */
-int _stunnel_connect_nodes (char* nodes)
+int _stunnel_connect_nodes (spank_t spank, char* nodes)
 {
-
-	char* host;
+	// char* host;
 	hostlist_t hlist;
 
 	// Connect to the first host in the list
 	hlist = slurm_hostlist_create(nodes);
-	host = slurm_hostlist_shift(hlist);
-	_connect_node(host);
+	tunnel_host = slurm_hostlist_shift(hlist);
+	_connect_node(spank, tunnel_host);
 	slurm_hostlist_destroy(hlist);
 
 	return 0;
@@ -301,35 +306,84 @@ int _stunnel_connect_nodes (char* nodes)
 
 /*
  * Generate ssh tunnels from a REMOTE context
- * ComputeNode --> Login Node in Remote Forwarding
+ * ComputeNode --> Submit Host in Remote Forwarding (default)
  *
  */
-int slurm_spank_user_init (spank_t sp, int ac, char **av)
-{
 
-	if (!spank_remote (sp))
-		return 0;
-	return 0;
-}
-/*
- * Generate ssh tunnels from a LOCAL context (srun)
- * Submit Host --> Compute Node in Local Forwarding
- * (_stunnel_connect_nodes, _connect_node)
- *
- */
-int slurm_spank_local_user_init (spank_t sp, int ac, char **av)
+int slurm_spank_task_init(spank_t spank, int ac, char **av)
+// int slurm_spank_user_init (spank_t spank, int ac, char **av) //root ?
 {
-
-	// nothing to do in remote mode
-	if (spank_remote (sp))
+	if (!spank_remote (spank)){
 		return 0;
+	}
 
 	// If there are no ssh args, then there is nothing to do
 	if (args == NULL){
 		goto exit;
 	}
-	if (strstr(args,"-L") == NULL){
+
+	char tunnel_mode[1024];
+	if (spank_getenv(spank, STUNNEL_MODE, tunnel_mode, sizeof(tunnel_mode)) == ESPANK_SUCCESS){
+			DEBUG("STUNNEL=> MODE======= %s", tunnel_mode);
+			// Tunnels are handled locally, skip
+			if(strcmp(tunnel_mode,"0") == 0){
+				DEBUG("STUNNEL=> Tunnels are started locally from submission host, skip");
+				return 0;
+			}
+	}else{
+		// No option provided
+		return 0;
+	}
+
+	int status = 0;
+
+	// Remote job is connecting to the submit host
+	tunnel_host = (char*) malloc(1024*sizeof(char));
+
+	if (spank_getenv(spank, "SLURM_SUBMIT_HOST", tunnel_host, 1024) == ESPANK_SUCCESS){
+		DEBUG("STUNNEL=> Submit host === %s",tunnel_host);
+	}else{
+		ERROR("STUNNEL=> Cannot retrieve submission host name. Exiting...");
+		exit(1);
+	}
+
+	// connect submit host
+	status = 	_connect_node(spank, tunnel_host);
+
+	clean_exit:
+
+	exit:
+	return status;
+}
+
+/*
+ * Generate ssh tunnels from a LOCAL context (srun)
+ * Submit Host --> First Compute Node in Local Forwarding (default)
+ * (_stunnel_connect_nodes, _connect_node)
+ * This function is not used when using sbatch/salloc
+ *
+ */
+int slurm_spank_local_user_init (spank_t spank, int ac, char **av)
+{
+	// nothing to do in remote mode
+	if (spank_remote (spank)){
+		return 0;
+	}
+
+	// If there are no ssh args, then there is nothing to do
+	if (args == NULL){
 		goto exit;
+	}
+
+	// Local mode
+	if (setenv(STUNNEL_MODE, "0", 1) < 0) {
+      ERROR("STUNNEL=> Cannot set stunnel mode");
+      return -1;
+  }
+	// For LOCAL srun, build control file here
+	if(_build_control_file(spank)){
+		ERROR("STUNNEL=> Cannot build controlfile name");
+		exit(1);
 	}
 
 	int status = 0;
@@ -339,7 +393,7 @@ int slurm_spank_local_user_init (spank_t sp, int ac, char **av)
 	job_info_t* job_ptr;
 
 	// get job id
-	if ( spank_get_item (sp, S_JOB_ID, &jobid)
+	if ( spank_get_item (spank, S_JOB_ID, &jobid)
 		 != ESPANK_SUCCESS ) {
 		status = -1;
 		goto exit;
@@ -348,14 +402,14 @@ int slurm_spank_local_user_init (spank_t sp, int ac, char **av)
 	// get job infos
 	status = slurm_load_job(&job_buffer_ptr,jobid,SHOW_ALL);
 	if ( status != 0 ) {
-		ERROR("stunnel: unable to get job infos");
+		ERROR("STUNNEL=> stunnel: unable to get job infos");
 		status = -3;
 		goto exit;
 	}
 
 	// check infos validity
 	if ( job_buffer_ptr->record_count != 1 ) {
-		ERROR("stunnel: job infos are invalid");
+		ERROR("STUNNEL=> stunnel: job infos are invalid");
 		status = -4;
 		goto clean_exit;
 	}
@@ -363,13 +417,13 @@ int slurm_spank_local_user_init (spank_t sp, int ac, char **av)
 
 	// check allocated nodes var
 	if ( job_ptr->nodes == NULL ) {
-		ERROR("stunnel: job has no allocated nodes defined");
+		ERROR("STUNNEL=> stunnel: job has no allocated nodes defined");
 		status = -5;
 		goto clean_exit;
 	}
 
 	// connect required nodes
-	status = _stunnel_connect_nodes(job_ptr->nodes);
+	status = _stunnel_connect_nodes(spank, job_ptr->nodes);
 
 	clean_exit:
 	slurm_free_job_info_msg(job_buffer_ptr);
@@ -379,19 +433,36 @@ int slurm_spank_local_user_init (spank_t sp, int ac, char **av)
 }
 
 /*
- * Because this is called multiple times, an exit flag file is set.  If it exists
- * (ie the second time around), the ssh tunnel is actually terminated.
- *
  * The termination command is:
  *
- *	   ssh <hostname> -S <controlfile> -O exit >/dev/null 2>&1
+ *	   ssh <hostname> -S <tunnel_controlfile> -O exit >/dev/null 2>&1
  *
- * The hostname needed for the termination command is obtained from the hostfile.
+ * The controlfile is, as established above, based on the uid and jobid.
  *
- * The controlfile is, as established above, based on the username.
+ * srun : the command is excuted by the user locally
+ * sbatch/salloc: the command is executed by root/the user running slurmd
+ * 				which should habe permission to terminate the tunnel for the user
  *
  */
-int slurm_spank_exit (spank_t sp, int ac, char **av){
+
+int close_tunnel(spank_t spank)
+{
+	// Control file will be set only on the machine having started the tunnel
+	if(tunnel_controlfile == NULL){
+		DEBUG("STUNNEL=> Control file is empty, nothing to do");
+		return 0;
+	}
+
+	DEBUG("STUNNEL=> Control file is %s", tunnel_controlfile);
+	DEBUG("STUNNEL=> Tunnel host is %s", tunnel_host);
+
+	// If the control file isn't there, don't do anything
+	if (!file_exists(tunnel_controlfile)){
+		ERROR("STUNNEL=> Control file %s does not exist",tunnel_controlfile);
+		return 0;
+	}
+
+
 	char* expc_cmd;
 	char* expc_pattern = "%s %s %s -S %s -O exit >/dev/null 2>&1";
 	size_t expc_length;
@@ -399,24 +470,12 @@ int slurm_spank_exit (spank_t sp, int ac, char **av){
 	int status = -1;
 
 	// Read the host file so the ssh command has a host
-	char host[1000];
-	read_host_file(host);
-	if (strcmp(host, "") == 0){
-		//fprintf(stderr,"empty host file\n");
-		return 0;
-	}
-
-	char *user = getenv("USER");
-	char controlfile[1024];
-	if (snprintf(controlfile,1024,CONTROL_FILE_PATTERN,user) > 1024){
-		fprintf(stderr,"Can't construct control file name; it's too big.");
-	}
-
-	// If the control file isn't there, don't do anything
-	if (!file_exists(controlfile)){
-		//fprintf(stderr,"Control file %s does not exist\n",controlfile);
-		return 0;
-	}
+	// char host[1000];
+	// read_host_file(host);
+	// if (strcmp(host, "") == 0){
+	// 	//ERROR("STUNNEL=> empty host file");
+	// 	return 0;
+	// }
 
 	// remove background ssh tunnels
 	expc_length = strlen(expc_pattern) + 128 ;
@@ -425,21 +484,70 @@ int slurm_spank_exit (spank_t sp, int ac, char **av){
 			( snprintf(expc_cmd,expc_length,expc_pattern,
 				(ssh_cmd == NULL) ? DEFAULT_SSH_CMD : ssh_cmd,
 				(ssh_args == NULL) ? DEFAULT_SSH_ARGS : ssh_args,
-				host,controlfile)
+				tunnel_host,
+				tunnel_controlfile)
 					>= expc_length )	) {
-		ERROR("tunnel: error while creating kill cmd");
+		ERROR("STUNNEL=> tunnel: error while creating kill cmd");
 	}
 	else {
+
+		DEBUG("STUNNEL=> ssh_cmd : %s", expc_cmd);
 		status = system(expc_cmd);
 		if ( status == -1 ) {
-			fprintf(stderr,"tunnel: unable to exec kill cmd %s",expc_cmd);
+			ERROR("STUNNEL=> tunnel: unable to exec kill cmd %s",expc_cmd);
 		}
 	}
 
+	if ( expc_cmd != NULL ){
+		free(expc_cmd);
+	}
 
-   if ( expc_cmd != NULL )
-	   free(expc_cmd);
-	return 0;
+	return status;
+}
+ /*
+  * Termination for REMOTE context with sbatch/salloc through task end
+	*
+	*/
+int slurm_spank_task_exit(spank_t spank, int ac, char **av)
+{
+	if (!spank_remote (spank)){
+		return 0;
+	}
+
+	char tunnel_mode[1024];
+	if (spank_getenv(spank, STUNNEL_MODE, tunnel_mode, sizeof(tunnel_mode)) == ESPANK_SUCCESS){
+			DEBUG("STUNNEL=> MODE======= %s", tunnel_mode);
+			// Tunnels are handled locally, skip
+			if(strcmp(tunnel_mode,"0") == 0){
+				DEBUG("STUNNEL=> Tunnels are started locally from submission host, skip");
+				return 0;
+			}
+	}else{
+		// No option provided
+		return 0;
+	}
+	tunnel_host = (char*) malloc(1024*sizeof(char));
+
+	if (spank_getenv(spank, "SLURM_SUBMIT_HOST", tunnel_host, 1024) == ESPANK_SUCCESS){
+		DEBUG("STUNNEL=> Submit host === %s",tunnel_host);
+	}else{
+		ERROR("STUNNEL=> Cannot retrieve submission host name. Exiting...");
+		// exit(1);
+	}
+
+	return close_tunnel(spank);
+}
+
+ /*
+  * Termination for LOCAL context with srun
+	*
+	*/
+int slurm_spank_exit (spank_t spank, int ac, char **av)
+{
+	if (spank_remote (spank)){
+		return 0;
+	}
+	return close_tunnel(spank);
 }
 
 
@@ -449,11 +557,13 @@ int slurm_spank_exit (spank_t sp, int ac, char **av){
  */
 static int _tunnel_opt_process (int val, const char *optarg, int remote)
 {
+	DEBUG("STUNNEL=> ================: OPT called %d",remote);
+
 	if (optarg == NULL) {
-		fprintf(stderr,"--tunnel requires an argument, e.g. 8888:8888");
+		ERROR("STUNNEL=> --tunnel requires an argument, e.g. 8888:8888");
 		return (0);
 	}
-
+	args = (char *)calloc(1024, sizeof(char));
 	char *portlist = strdup(optarg);
 	int portpaircount = 1;
 	int i = 0;
@@ -477,61 +587,123 @@ static int _tunnel_opt_process (int val, const char *optarg, int remote)
 	free(portlist);
 
 	//Go through the port pairs and create the switch string
-	int first;
-	int second;
-	char *p;
 	if (numpairs == 0){
 		return (0);
 	}
-	if (args == NULL){
-		args = (char *)calloc(1024, sizeof(char));
-	}
-	for (i=0; i<numpairs; i++){
-		char *firststr = strtok_r(portpairs[i],":",&ptr);
-		char *secondstr = strtok_r(NULL,":",&ptr);
+	DEBUG("STUNNEL=> %d tunnel pairs specified", numpairs);
 
-		if (secondstr == NULL){
-			fprintf(stderr,"--tunnel parameter needs two numeric ports separated by a colon\n");
+	for (i=0; i<numpairs; i++){
+		// char *directioon = strtok_r(portpairs[i],":",&ptr);
+		char *firststr = strtok_r(portpairs[i],":",&ptr);
+		char *hoststr = strtok_r(NULL,":",&ptr);
+
+		if (hoststr == NULL){
+			ERROR("STUNNEL=> --tunnel parameter needs two numeric ports separated by a colon");
 			free(portpairs);
 			exit(1);
 		}
 
+		// Optionnal destination host - default to localhost
+		char *secondstr = strtok_r(NULL,":",&ptr);
+		if (secondstr == NULL){
+			secondstr=hoststr;
+			hoststr="localhost";
+		}
+
+		int first;
+		int second;
+		char *p;
+		char *to = malloc(sizeof(char));
+
+		DEBUG("STUNNEL=> FIRST PORT : %s", firststr);
+		DEBUG("STUNNEL=> SECOND PORT : %s", secondstr);
+		DEBUG("STUNNEL=> HOST : %s", hoststr);
+		strncpy(to, firststr, 1);
+		to[1]='\0';
+
+		if (strcmp(to,"R") == 0 || strcmp(to,"L") == 0){
+			firststr+=1;
+		}else{
+			if (spank_context() == S_CTX_REMOTE){
+				// Default is remote port forwarding
+				to="R";
+			}else if(spank_context() == S_CTX_LOCAL){
+				// Default is Local port forwarding
+				to="L";
+			}
+		}
 		first = atoi(firststr);
 		second = atoi(secondstr);
 
-		free(portpairs[i]);
 
 		if (first == 0 || second == 0){
-			fprintf(stderr,"--tunnel parameter requires two numeric ports separated by a colon\n");
+			ERROR("STUNNEL=> --tunnel parameter requires two numeric ports separated by a colon");
 			free(portpairs);
 			exit(1);
 		}
 		if (first < 1024 || second < 1024){
-			fprintf(stderr,"--tunnel cannot be used for privileged ports (< 1024)\n");
+			ERROR("STUNNEL=> --tunnel cannot be used for privileged ports (< 1024)");
 			free(portpairs);
 			exit(1);
 		}
 
-		if (!port_available(first)){
-			fprintf(stderr,"port %d is in use or unavailable\n",first);
+		if (strcmp(to,"L") == 0 && !port_available(first)){
+			ERROR("STUNNEL=> Local port %d is in use or unavailable",first);
 			free(portpairs);
 			exit(1);
 		}
+		if (strcmp(to,"R") == 0 && !port_available(second)){
+			ERROR("STUNNEL=> Local port %d is in use or unavailable",second);
+			free(portpairs);
+			exit(1);
+		}
+
 		p = strdup(args);
-		snprintf(args,256," %s -L %d:localhost:%d ",p,first,second);
-		free(portpairs);
+		snprintf(args,256," %s -%s%d:%s:%d ",p,to,first,hoststr,second);
+		DEBUG("STUNNEL=> Adding tunnel arg: %s", args);
+		free(portpairs[i]);
 		free(p);
 	}
+	free(portpairs);
 
+	DEBUG("STUNNEL=> full args : %s", args);
+
+	// Init STUNNEL_MODE to 1, default is batch mode
+	if(args != NULL){
+		if (setenv(STUNNEL_MODE, "1", 1) < 0) {
+			ERROR("STUNNEL=> Cannot set stunnel mode");
+			return -1;
+		}
+	}
 	return (0);
 }
 
 
 /*
+ *  Provide a --tunnel option to srun:
+ */
+
+struct spank_option spank_opts[] =
+{
+		{
+				"tunnel",
+				"<submit port:exec port[,submit port:exec port,...]>",
+				"Forward exec host port to submit host port via ssh -L",
+				1,
+				0,
+				(spank_opt_cb_f) _tunnel_opt_process
+		},
+		SPANK_OPTIONS_TABLE_END
+};
+
+
+
+/*
  * Process any options on the plugstack.conf line
  */
-void _stunnel_init_config(spank_t sp, int ac, char *av[])
+void _stunnel_init_config(spank_t spank, int ac, char *av[])
 {
+	DEBUG("STUNNEL=> Parsing config file");
 	int i;
 	char* elt;
 	char* p;
@@ -567,9 +739,48 @@ void _stunnel_init_config(spank_t sp, int ac, char *av[])
 			}
 		}
 	}
+	DEBUG("STUNNEL=> ssh_cmd : %s", ssh_cmd);
+	DEBUG("STUNNEL=> ssh_args : %s", ssh_args);
+	DEBUG("STUNNEL=> helpertask_args : %s", helpertask_args);
 
-	DEBUG("ssh_cmd : %s", ssh_cmd);
-	DEBUG("ssh_args : %s", ssh_args);
-	DEBUG("helpertask_args : %s", helpertask_args);
+}
 
+/*
+ *
+ * This is used to process any options in the config file
+ *
+ */
+
+int slurm_spank_init (spank_t spank, int ac, char *av[])
+{
+	if (spank_option_register(spank, spank_opts) != ESPANK_SUCCESS) {
+		ERROR("STUNNEL=> Cannot register stunnel plugin");
+		return (-1);
+  }
+
+	_stunnel_init_config(spank, ac, av);
+	return 0;
+}
+
+/*
+ *
+ * Build SSH control file
+ *
+ */
+int slurm_spank_init_post_opt (spank_t spank, int ac, char *av[])
+{
+	// Env are only necessary in remote context to pass to exit
+	if (!spank_remote (spank)){
+		return 0;
+	}
+
+	// Build control file in Remote context with necessary env
+	if(args != NULL){
+		if(_build_control_file(spank)){
+			ERROR("STUNNEL=> Cannot build controlfile name");
+			exit(1);
+		}
+	}
+
+	return 0;
 }
