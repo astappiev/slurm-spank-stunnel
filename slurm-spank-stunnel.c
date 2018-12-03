@@ -254,8 +254,8 @@ int _connect_node (spank_t spank, char* node)
 
 	// sshcmd is already set
 	expc_length = strlen(node) +
-								strlen(ssh_cmd) +
-								strlen(ssh_args) +
+								strlen(((ssh_cmd == NULL) ? DEFAULT_SSH_CMD : ssh_cmd)) +
+								strlen(((ssh_args == NULL) ? DEFAULT_SSH_ARGS : ssh_args)) +
 								strlen(args) +
 								strlen(tunnel_controlfile) +
 								strlen(helpertask_args) +
