@@ -17,6 +17,15 @@ The general command looks like:
 $ srun [options] --tunnel=<submit_host_port>:<compute_node_port>[,<submit_host_port>:<compute_node_port>]
 ```
 
+### Install
+
+Compile with the .spec file or use
+```
+gcc -I/path/to/slurm/source -shared -fPIC -o stunnel.so slurm-spank-stunnel.c
+```
+
+and add the plugin to `plugstack.conf` (refer to the example for configuration)
+
 ### Context
 * Tunnels started with `srun` are started from the local context  
 `submit_host --> compute_node`
