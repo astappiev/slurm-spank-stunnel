@@ -21,9 +21,10 @@ $ srun [options] --tunnel=<submit_host_port>:<compute_node_port>[,<submit_host_p
 
 Compile with the .spec file or use
 ```
-gcc -I/path/to/slurm/source -shared -fPIC -o stunnel.so slurm-spank-stunnel.c
+gcc -I/path/to/slurm/source -shared -fPIC -o slurm-spank-stunnel.so slurm-spank-stunnel.c
 ```
 
+Copy `slurm-spank-stunnel.so` to `/usr/lib64/` or a custom destination 
 and add the plugin to `plugstack.conf` (refer to the example for configuration)
 
 ### Context
