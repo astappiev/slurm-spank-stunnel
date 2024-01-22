@@ -293,7 +293,7 @@ int _connect_node (spank_t spank, char* node)
 int _stunnel_connect_nodes (spank_t spank, char* nodes)
 {
 	// char* host;
-	hostlist_t hlist;
+	hostlist_t* hlist;
 
 	// Connect to the first host in the list
 	hlist = slurm_hostlist_create(nodes);
